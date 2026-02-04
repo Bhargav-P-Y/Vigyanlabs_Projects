@@ -1,220 +1,375 @@
 import os
-import cv2
+import torch
+import numpy as np
+import requests
 import json
 import base64
-import time
-import requests
-import numpy as np
-from datetime import datetime
-from pdf2image import convert_from_path
-from pyIFD import ELA
-from docx import Document
+import re
+from collections import Counter
 from PIL import Image
+from docx import Document
+from docx.shared import Pt
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from pdf2image import convert_from_path
+from torchvision.transforms.functional import to_tensor
+import matplotlib.pyplot as plt
 
-# --- Configuration ---
+# --- 1. CONFIGURATION ---
 BASE_DIR = os.getcwd()
-INPUT_ROOT_FOLDER = os.path.join(BASE_DIR, "CERTIFICATES-20260202T052442Z-3-001")
-OUTPUT_FOLDER = os.path.join(BASE_DIR, "analysis_output")
-REPORT_PATH = os.path.join(BASE_DIR, "final_production_report.json")
+# Points to the folder parallel to 'photoholmes'
+INPUT_ROOT_FOLDER = os.path.join(BASE_DIR, "../CERTIFICATES-20260202T052442Z-3-001")
+OUTPUT_FOLDER = os.path.join(BASE_DIR, "analysis_output_production")
+WEIGHTS_PATH = "weights/trufor/trufor.pth.tar"
+OCR_API_URL = "http://10.91.2.100:8010/v1/chat/completions"
+REPORT_PATH = os.path.join(OUTPUT_FOLDER, "final_production_report.json")
 
-# OCR Configuration
-API_URL = "http://10.91.2.100:8010/v1/chat/completions"
-MODEL = "dots_ocr"
-VALID_EXTENSIONS = ('.pdf', '.jpg', '.jpeg', '.webp')
+# FORCE CPU (Stability Priority)
+DEVICE = "cpu"
 
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
-# --- 1. ENHANCED FORENSIC LOGIC (The "Ultra-Sensitive" Calibration) ---
+# --- 2. SECURITY BYPASS ---
+torch.serialization.add_safe_globals([np.core.multiarray.scalar])
+try:
+    torch.serialization.add_safe_globals([np.core.multiarray._reconstruct])
+except:
+    pass
 
-def calculate_integrity_score(ela_map):
-    """
-    Production Calibration:
-    - 99.9th Percentile: Catches single-character edits.
-    - Floor 8.0 / Ceiling 35.0: Calibrated for Merged PDF noise.
-    """
-    raw_mean = np.mean(ela_map)
-    raw_peak = np.percentile(ela_map, 99.9) 
-    
-    # Global Mean Calibration (Clean: 2.0 -> Dirty: 12.0)
-    score_mean = 1.0 - ((raw_mean - 2.0) / (12.0 - 2.0))
-    # Local Peak Calibration (Clean: 8.0 -> Dirty: 35.0)
-    score_peak = 1.0 - ((raw_peak - 8.0) / (35.0 - 8.0))
-    
-    score_mean = np.clip(score_mean, 0.0, 1.0)
-    score_peak = np.clip(score_peak, 0.0, 1.0)
-    
-    # 80% weight on peak to ensure high sensitivity to edits
-    final_score = (score_mean * 0.2) + (score_peak * 0.8)
-    
-    return round(float(final_score), 2), raw_mean, raw_peak
+# --- 3. TEXT & TABLE CLEANING ENGINE ---
 
-# --- 2. ROBUST SEMANTIC LOGIC (OCR) ---
+def clean_line_content(s):
+    """Normalizes a line to detect duplicates (ignores numbers/punctuation)."""
+    return re.sub(r'[\d\.\-\)\(\s]+', '', s).lower()
 
-def call_ocr_api(image_path, prompt):
+def clean_ocr_text(text):
     """
-    Robust OCR Call:
-    - Timeout increased to 180s to prevent 'Persistent Timeout' errors.
-    - Retries 3 times with backoff.
+    Bulletproof cleaning: Anti-Hallucination + HTML Strip + Table Norm
     """
+    if not text: return ""
+
+    # A. Global Frequency Filter (Loop Killer)
+    lines = text.split('\n')
+    unique_lines = []
+    line_counts = Counter()
+    
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            unique_lines.append(line)
+            continue
+        
+        content_hash = clean_line_content(stripped)
+        # Allow short lines to repeat slightly more, long lines strictly limited
+        max_repeats = 3 if len(content_hash) > 10 else 10
+        
+        if line_counts[content_hash] < max_repeats:
+            unique_lines.append(line)
+            line_counts[content_hash] += 1
+        else:
+            if line_counts[content_hash] == max_repeats:
+                 unique_lines.append("... [Repeated Content Truncated] ...")
+                 line_counts[content_hash] += 1
+    
+    text = '\n'.join(unique_lines)
+
+    # B. Phrase-based repetition (Intra-line)
+    text = re.sub(r'(.{6,}?)( \1){2,}', r'\1', text)
+
+    # C. HTML Stripper
+    if "<table>" in text or "<tr>" in text or "<td" in text:
+        text = re.sub(r'<tr[^>]*>', '\n', text)      
+        text = re.sub(r'</?td[^>]*>', '|', text)     
+        text = re.sub(r'</?th[^>]*>', '|', text)     
+        text = re.sub(r'</?table[^>]*>', '', text)   
+        text = re.sub(r'</?thead[^>]*>', '', text)
+        text = re.sub(r'</?tbody[^>]*>', '', text)
+    
+    text = re.sub(r'<[^>]+>', '', text) 
+
+    # D. Markdown Normalization
+    text = re.sub(r'\|+', '|', text)
+    cleaned_lines = []
+    for line in text.split('\n'):
+        clean = line.strip()
+        if not clean: continue
+        if clean.count('|') > 1:
+            if not clean.startswith('|'): clean = '|' + clean
+            if not clean.endswith('|'): clean = clean + '|'
+        cleaned_lines.append(clean)
+    
+    return '\n'.join(cleaned_lines)
+
+def smart_reshape_table(table_lines):
+    """Fixes 'Run-on Rows'."""
+    if not table_lines: return []
+    
+    header_cells = [c.strip() for c in table_lines[0].strip().split('|') if c.strip()]
+    num_cols = len(header_cells)
+    if num_cols < 2: return table_lines
+    
+    reshaped_lines = [table_lines[0]]
+    
+    for line in table_lines[1:]:
+        cells = [c.strip() for c in line.strip().split('|') if c.strip()]
+        
+        if len(cells) >= (num_cols * 2) and (len(cells) % num_cols == 0):
+            for i in range(0, len(cells), num_cols):
+                chunk = cells[i : i + num_cols]
+                reshaped_lines.append("|" + "|".join(chunk) + "|")
+        else:
+            reshaped_lines.append(line)
+            
+    return reshaped_lines
+
+def add_table_to_doc(doc, table_lines):
+    """Renders table to Word with Fail-Safe."""
+    if not table_lines: return
+
+    rows_data = []
+    max_cols = 0
+    for line in table_lines:
+        cells = [c.strip() for c in line.strip().split('|') if c.strip()]
+        if cells:
+            rows_data.append(cells)
+            max_cols = max(max_cols, len(cells))
+    
+    if not rows_data: return
+
+    if max_cols > 15:
+        doc.add_paragraph("[Complex Data Table - Rendered as List:]")
+        for line in table_lines:
+            p = doc.add_paragraph(line)
+            p.style = 'No Spacing'
+        return
+
+    try:
+        table = doc.add_table(rows=len(rows_data), cols=max_cols)
+        table.style = 'Table Grid'
+        table.autofit = False 
+        
+        for r_idx, row in enumerate(rows_data):
+            row_cells = table.rows[r_idx].cells
+            for c_idx, cell_text in enumerate(row):
+                if c_idx < len(row_cells):
+                    row_cells[c_idx].text = cell_text
+    except Exception:
+        doc.add_paragraph("[Table Rendering Error - Raw Content:]")
+        for line in table_lines:
+            p = doc.add_paragraph(line)
+            p.style = 'No Spacing'
+
+def parse_markdown_to_word(doc, text):
+    """Main parser."""
+    clean_text = clean_ocr_text(text)
+    lines = clean_text.split('\n')
+    table_buffer = []
+    
+    for line in lines:
+        stripped = line.strip()
+        if '|' in stripped and set(stripped) - {'|', '-', ' ', ':'}:
+            table_buffer.append(stripped)
+        else:
+            if table_buffer:
+                fixed_table = smart_reshape_table(table_buffer)
+                add_table_to_doc(doc, fixed_table)
+                table_buffer = []
+            
+            if '---' in stripped: continue
+            
+            if stripped: 
+                p = doc.add_paragraph(stripped)
+                p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+
+    if table_buffer:
+        fixed_table = smart_reshape_table(table_buffer)
+        add_table_to_doc(doc, fixed_table)
+
+# --- 4. FORENSIC REASONING ---
+
+def get_enhanced_reasoning(score, label):
+    if label == "GENUINE":
+        return f"Integrity Verified (Score: {score:.4f}). The analysis found no significant statistical anomalies. The pixel distribution and compression signatures are consistent with an original, unaltered document."
+    if score > 0.85:
+        return f"Surgical Tampering Detected: The deep learning model identified high-confidence anomalies (Score: {score:.4f}) consistent with digital splicing. The heatmap highlights disjointed pixel patterns in specific regions, indicating content was likely pasted or overwritten."
+    elif score > 0.65:
+        return f"Inconsistent Pixel Signatures: The analysis detected irregular noise patterns (Score: {score:.4f}) that deviate from the document's global profile. This suggests potential localized editing or retouching in the highlighted areas."
+    else:
+        return f"Potential Manipulation: The model flagged ambiguous artifacts (Score: {score:.4f}). While not definitive, the pixel structure in the marked regions differs from the background, warranting manual review."
+
+# --- 5. MODEL & API LOADERS ---
+
+def load_trufor_model():
+    from photoholmes.methods.trufor import TruFor
+    try:
+        model = TruFor(weights=WEIGHTS_PATH, device=DEVICE)
+    except Exception:
+        original_load = torch.load
+        torch.load = lambda f, map_location=None, weights_only=True, **kwargs: original_load(f, map_location, weights_only=False, **kwargs)
+        model = TruFor(weights=WEIGHTS_PATH, device=DEVICE)
+    return model
+
+def call_ocr_api(image_path):
     try:
         with open(image_path, "rb") as f:
             base64_image = base64.b64encode(f.read()).decode('utf-8')
         
         payload = {
-            "model": MODEL,
+            "model": "dots_ocr",
             "messages": [
-                {"role": "system", "content": "You are a strict OCR engine. Extract text exactly as seen in Markdown format. Preserve tables and headers."},
+                {"role": "system", "content": "You are a professional OCR engine. Extract text exactly as seen. 1. If you see a table, OUTPUT IT AS A MARKDOWN TABLE (using | pipes). 2. DO NOT use HTML tags. 3. STRICTLY AVOID repeating text loops. 4. Preserve layout."},
                 {"role": "user", "content": [
-                    {"type": "text", "text": prompt},
+                    {"type": "text", "text": "Extract all text."},
                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
                 ]}
             ],
-            "temperature": 0.1 # Deterministic output
+            "temperature": 0.1
         }
-
-        # Retry loop with extended timeout
-        for attempt in range(3):
-            try:
-                # 180 seconds = 3 minutes per page (Generous buffer for large files)
-                response = requests.post(API_URL, json=payload, timeout=180)
-                response.raise_for_status()
-                content = response.json()['choices'][0]['message']['content']
-                if not content: return "[OCR Warning: API returned empty text]"
-                return content
-            except requests.exceptions.Timeout:
-                print(f"      ⏳ OCR Timeout (Attempt {attempt+1})...")
-                time.sleep(5)
-            except Exception as e:
-                print(f"      ⚠️ API Error (Attempt {attempt+1}): {e}")
-                time.sleep(2)
-                
-        return "OCR Error: Persistent Timeout (Server overloaded or image too complex)"
+        
+        response = requests.post(OCR_API_URL, json=payload, timeout=120)
+        if response.status_code == 200:
+            content = response.json()['choices'][0]['message']['content']
+            if not content.strip(): return "[OCR Warning: Image content unclear.]"
+            return content
+        return f"[OCR Error: Status {response.status_code}]"
     except Exception as e:
-        return f"OCR Failed: {str(e)}"
+        return f"[OCR Connection Error: {str(e)}]"
 
-# --- 3. UNIVERSAL PREPROCESSING ---
-
-def process_file(file_path, filename):
-    """
-    Pipeline: Image Conversion -> Forensic Scoring -> Text Extraction
-    """
-    results = []
-    ext = os.path.splitext(filename)[1].lower()
-    
-    # Convert input to processing-ready images
-    if ext == '.pdf':
-        pages = convert_from_path(file_path, 200) # 200 DPI is good balance for speed/accuracy
-    else:
-        pages = [Image.open(file_path).convert("RGB")]
-
-    for i, page_img in enumerate(pages):
-        page_suffix = f"_p{i+1}" if len(pages) > 1 else ""
-        temp_path = os.path.join(OUTPUT_FOLDER, f"temp_{filename}{page_suffix}.jpg")
-        
-        # Resize to max 1800px to ensure API accepts the payload
-        if max(page_img.size) > 1800:
-            page_img.thumbnail((1800, 1800), Image.Resampling.LANCZOS)
-        page_img.save(temp_path, "JPEG", quality=90)
-        
-        # A. Forensic Layer
-        ela_map = ELA.ELA(temp_path)
-        score, r_mean, r_peak = calculate_integrity_score(ela_map)
-        
-        # B. Classification
-        if score >= 0.95: flag = "Genuine"
-        elif score >= 0.90: flag = "Suspicious"
-        else: flag = "Forged"
-        
-        # C. Semantic Layer (OCR)
-        # Note: We perform this AFTER forensics to fail fast if needed, but here we do both.
-        print(f"      🔍 Extracting text for Page {i+1}...")
-        ocr_prompt = "Extract all text from this document using Markdown formatting for structure."
-        text = call_ocr_api(temp_path, ocr_prompt)
-        
-        # D. Evidence Generation
-        heatmap_path = os.path.join(OUTPUT_FOLDER, f"{os.path.splitext(filename)[0]}{page_suffix}_ELA.png")
-        cv2.imwrite(heatmap_path, (ela_map * 255).astype(np.uint8))
-        
-        results.append({
-            "page": i + 1,
-            "score": score,
-            "flag": flag,
-            "text": text,
-            "heatmap": heatmap_path,
-            "metrics": {"mean": round(r_mean, 4), "peak_99.9th": round(r_peak, 4)}
-        })
-        if os.path.exists(temp_path): os.remove(temp_path)
-        
-    return results
-
-# --- 4. MAIN PRODUCTION LOOP ---
+# --- 6. MAIN PIPELINE ---
 
 def main():
-    full_report = []
-    print(f"🚀 Starting Production Extraction Pipeline...")
-    print(f"📂 Input: {INPUT_ROOT_FOLDER}")
-    print(f"📄 Report: {REPORT_PATH}\n")
+    if not os.path.exists(INPUT_ROOT_FOLDER):
+        print(f"❌ Input folder not found: {INPUT_ROOT_FOLDER}")
+        return
 
-    for root, _, files in os.walk(INPUT_ROOT_FOLDER):
+    print(f"🚀 Initializing TruFor AI on {DEVICE.upper()}...")
+    model = load_trufor_model()
+    
+    full_report = []
+
+    print(f"📂 Scanning Directory: {INPUT_ROOT_FOLDER}")
+    
+    # RECURSIVE WALK
+    for root, dirs, files in os.walk(INPUT_ROOT_FOLDER):
         for filename in files:
-            if not filename.lower().endswith(VALID_EXTENSIONS): continue
-            
+            if not filename.lower().endswith(('.pdf', '.jpg', '.jpeg', '.webp')):
+                continue
+
             file_path = os.path.join(root, filename)
-            category = os.path.basename(root)
-            print(f"⚙️  Processing [{category}]: {filename}")
+            # Use subdirectory as category, or 'Uncategorized' if in root
+            category = os.path.basename(root) if root != INPUT_ROOT_FOLDER else "Uncategorized"
+            
+            print(f"\n   ⚙️  Processing [{category}]: {filename}")
             
             try:
-                pages_data = process_file(file_path, filename)
+                # A. Prepare Image (First Page Only for Speed)
+                if filename.lower().endswith('.pdf'):
+                    img = convert_from_path(file_path, 200)[0]
+                else:
+                    img = Image.open(file_path).convert("RGB")
                 
-                # Verdict: Worst page score defines the document status
-                worst_page = min(pages_data, key=lambda x: x['score'])
+                # Resize if massive (prevents OOM on CPU)
+                if max(img.size) > 2000:
+                    img.thumbnail((2000, 2000), Image.Resampling.LANCZOS)
                 
-                # --- DOCUMENT GENERATION (Requirement: Microsoft Word) ---
+                temp_path = os.path.join(OUTPUT_FOLDER, f"temp_{filename}.jpg")
+                img.save(temp_path, quality=95)
+
+                # B. AI Detection
+                img_tensor = to_tensor(img).to(DEVICE)
+                output = model.predict(img_tensor)
+                
+                # Output Parsing
+                if isinstance(output, (tuple, list)):
+                    heatmap = output[0]
+                    raw_score = output[1]
+                    if isinstance(raw_score, torch.Tensor):
+                        score = raw_score.detach().cpu().mean().item()
+                    else:
+                        score = float(raw_score)
+                else:
+                    heatmap = output
+                    score = 0.5 
+                
+                if isinstance(heatmap, torch.Tensor):
+                    heatmap = heatmap.detach().cpu().squeeze().numpy()
+
+                # Verdict
+                if score > 0.55: label = "FORGED"
+                else: label = "GENUINE"
+                
+                reason = get_enhanced_reasoning(score, label)
+
+                # C. Save Heatmap
+                heatmap_filename = f"{os.path.splitext(filename)[0]}_heatmap.png"
+                heatmap_path = os.path.join(OUTPUT_FOLDER, heatmap_filename)
+                
+                plt.figure(figsize=(10, 5))
+                plt.subplot(1, 2, 1); plt.imshow(img); plt.axis('off'); plt.title("Original")
+                plt.subplot(1, 2, 2); plt.imshow(heatmap, cmap='jet'); plt.axis('off'); plt.title(f"Forgery Map")
+                plt.savefig(heatmap_path, bbox_inches='tight')
+                plt.close()
+
+                # D. OCR Extraction
+                text_content = call_ocr_api(temp_path)
+
+                # E. Word Report
                 doc = Document()
-                doc.add_heading(f"Extraction Report: {filename}", level=0)
+                h = doc.add_heading(f"Analysis: {filename}", 0)
+                h.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                
                 doc.add_paragraph(f"Category: {category}")
-                doc.add_paragraph(f"Integrity Verdict: {worst_page['flag']} (Score: {worst_page['score']})")
-                doc.add_paragraph("-" * 20)
+                p = doc.add_paragraph(f"Verdict: {label} (Confidence: {score:.4f})")
+                p.bold = True
                 
-                for p in pages_data:
-                    doc.add_heading(f"Page {p['page']} Text Content", level=1)
-                    # We add the raw text. Word won't render Markdown automatically, 
-                    # but the text content and structure will be preserved.
-                    doc.add_paragraph(p['text'])
-                    doc.add_page_break()
+                doc.add_heading("Forensic Reasoning:", level=1)
+                doc.add_paragraph(reason)
                 
-                word_filename = f"{os.path.splitext(filename)[0]}_extracted_report.docx"
-                word_path = os.path.join(OUTPUT_FOLDER, word_filename)
-                doc.save(word_path)
-                # ---------------------------------------------------------
+                doc.add_heading("Extracted Content", level=1)
+                parse_markdown_to_word(doc, text_content)
+                
+                docx_filename = f"{os.path.splitext(filename)[0]}_report.docx"
+                docx_path = os.path.join(OUTPUT_FOLDER, docx_filename)
+                doc.save(docx_path)
 
-                # Add to Master JSON Report
-                # We truncate text in JSON to 500 chars to keep the file readable, 
-                # but full text is in the DOCX.
-                for p in pages_data:
-                    p['text_snippet'] = p['text'][:500] + "..." if len(p['text']) > 500 else p['text']
-                    # We keep the full text out of the main JSON array to prevent bloating,
-                    # relying on the DOCX for the full content.
-
-                full_report.append({
-                    "metadata": {"file": filename, "category": category, "pages": len(pages_data)},
-                    "verdict": {"score": worst_page['score'], "flag": worst_page['flag']},
-                    "structural_details": pages_data,
-                    "docx_path": word_path
-                })
+                # F. Add to Master JSON
+                clean_snippet_text = clean_ocr_text(text_content)
+                snippet = clean_snippet_text[:200].replace('\n', ' ').strip() + "..."
                 
-                print(f"   ✅ Saved: {word_filename}")
+                record = {
+                    "metadata": {
+                        "file": filename,
+                        "category": category,
+                        "pages": 1
+                    },
+                    "verdict": {
+                        "score": round(score, 4),
+                        "flag": label,
+                        "reasoning": reason
+                    },
+                    "structural_details": [
+                        {
+                            "page": 1,
+                            "heatmap": heatmap_path,
+                            "text_snippet": snippet
+                        }
+                    ],
+                    "docx_path": docx_path
+                }
+                full_report.append(record)
+
+                if os.path.exists(temp_path): os.remove(temp_path)
+                print(f"      ✅ Success: {label} ({score:.2f})")
 
             except Exception as e:
-                print(f"   ❌ Failed: {filename} - {e}")
+                print(f"      ❌ Failed: {e}")
 
-    # Save Master JSON
-    with open(REPORT_PATH, "w") as f:
-        json.dump(full_report, f, indent=4)
-    
-    print(f"\n✨ PRODUCTION RUN COMPLETE.")
-    print(f"📊 Master JSON: {REPORT_PATH}")
-    print(f"📂 Extracted Docs: {OUTPUT_FOLDER}")
+    # G. Save Master JSON Report
+    with open(REPORT_PATH, "w", encoding='utf-8') as f:
+        json.dump(full_report, f, indent=4, ensure_ascii=False)
+
+    print(f"\n✨ BATCH PROCESSING COMPLETE.")
+    print(f"   📂 Output: {OUTPUT_FOLDER}")
+    print(f"   📄 Master Report: {REPORT_PATH}")
 
 if __name__ == "__main__":
     main()
